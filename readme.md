@@ -5,6 +5,28 @@ John Duncan Grewar, Michael John Koning, Debra Carter, Lesley S. van
 Helden, Kerry Loxley, Camilla T. Weyer
 2023-04-18
 
+## Data and data considerations
+
+The `data` folder of this repository contains the following files (with
+descriptions)
+
+#### 2022Horses.csv
+
+This is the data file used to establish all routing data for the
+manuscript.
+
+| variable        | type    | description                          | notes                                                                       |
+|-----------------|---------|--------------------------------------|-----------------------------------------------------------------------------|
+| `id`            | integer | movement event unique identifier     |                                                                             |
+| `movementdate`  | date    | date of movement                     | as applied for, retrospective verification of movement dates not undertaken |
+| `totalequids`   | integer | number of equids moved               |                                                                             |
+| `srcid`         | integer | reference for holding at origin      |                                                                             |
+| `src_longitude` | numeric | longitude for origin                 | coordinate has been randomly moved slightly to protect privacy              |
+| `src_latitude`  | numeric | latitude for origin                  | coordinate has been randomly moved slightly to protect privacy              |
+| `dstid`         | integer | reference for holding at destination |                                                                             |
+| `dst_longitude` | numeric | longitude for destination            | coordinate has been randomly moved slightly to protect privacy              |
+| `dst_latitude`  | numeric | latitude for destination             | coordinate has been randomly moved slightly to protect privacy              |
+
 ## Section 1 - Creating the routes and database
 
 The following libraries are required for this section
