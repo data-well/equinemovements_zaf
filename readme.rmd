@@ -1,0 +1,498 @@
+---
+title: "Analysis script: Movement patterns of equines into the African horse sickness controlled area of South Africa"
+author: "John Duncan Grewar, Michael John Koning, Debra Carter, Lesley S. van Helden, Kerry Loxley, Camilla T. Weyer"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Section 1 - Creating the routes and database
+
+The following libraries are required for this section
+
+```{r section1Required, eval=FALSE}
+#Language: R
+library(osrm)
+library(sf)
+library(RPostgreSQL)
+```
+
+[Open Street Map routes](https://project-osrm.org/) are created using the prepared data set.
+
+```{r, eval=FALSE}
+#Language: R
+routing <- read.csv("data/2022Horses.csv")
+#An empty routes data frame to absorb the returning routes from OSM 
+routes = data.frame()
+
+for (i in 1:nrow(routing)){
+  temproute = merge(osrmRoute(c(routing[i,]$src_longitude, routing[i,]$src_latitude), 
+                              c(routing[i,]$dst_longitude, routing[i,]$dst_latitude), 
+                              overview = 'full'),
+                    routing[i,])
+  routes = rbind(routes, temproute)
+}
+
+routes$movementdate = as.Date(routes$movementdate)
+```
+
+For management of the data use a [PostgreSQL](https://www.postgresql.org/download/) database. We use [pgAdmin](https://www.pgadmin.org/) to interact with our PostgreSQL databases and this is likely to have been installed, particularly if you use [EDB](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads) installers. The following `R` script will create a database `horsemovementszaf` in the local environment.
+
+```{r, eval=FALSE}
+#Language: R
+con <- dbConnect(PostgreSQL(), 
+                 dbname = "postgres", 
+                 user = "yourusernamehere", 
+                 password = "yourpasswordhere", 
+                 host = "localhost", 
+                 port = 5432)
+
+dbSendQuery(con, "CREATE DATABASE horsemovementszaf")
+dbDisconnect(con)
+```
+
+In your local database created above please make sure you have the the `postgis` and `postgis_raster` extensions activated for working with spatial objects and raster files. These extensions can be installed after opening a query in your `horsemovementszaf` database.
+
+```{sql, eval=FALSE}
+--Language: SQL
+CREATE EXTENSION postgis;
+CREATE EXTENSION postgis_raster;
+```
+
+Write the newly created spatial routing file to the database
+
+```{r, eval=FALSE}
+#Language: R
+con <- dbConnect(
+  PostgreSQL(),
+  dbname = 'horsemovementszaf',
+  host = 'localhost',
+  port = 5432,
+  user = 'yourusernamehere',
+  password = 'yourpasswordhere'
+)
+
+#Write the sf object into the database
+table_name <- "routing2022"
+
+st_write(
+  routes, 
+  con, 
+  layer = table_name, 
+  driver = "PostgreSQL",
+  append = FALSE # this overwrites the existing table if it is there
+)
+
+dbDisconnect(con)
+```
+
+## Section 2 - Rasterise movement routes for aggregation at annual and monthly intervals
+
+### Import routes data with added month variable from database
+
+```{r, eval=FALSE}
+#Language: R
+library(terra)
+library(rpostgis)
+library(raster)
+library(RPostgreSQL)
+
+con <- dbConnect(
+  PostgreSQL(),
+  dbname = 'horsemovementszaf',
+  host = 'localhost',
+  port = 5432,
+  user = 'yourusernamehere',
+  password = 'yourpasswordhere'
+)
+
+#Query the routes but include a month number to evaluate at monthly intervals
+routes = pgGetGeom(con, 
+query = "
+SELECT id, 
+EXTRACT(MONTH FROM movementdate) AS month_number, 
+totalequids,
+geometry AS geom
+FROM routing2022;"
+)
+
+dbDisconnect(con)
+```
+
+### Rasterise and write rasters to database
+
+```{r, eval=FALSE}
+#Language: R
+
+#Create an empty raster bound by South African borders
+SA_boundary <- terra::vect("./data/rsa.shp")
+r <- terra::rast(SA_boundary, res=0.0866)
+
+#Open database connection
+con <- dbConnect(
+  PostgreSQL(),
+  dbname = 'horsemovementszaf',
+  host = 'localhost',
+  port = 5432,
+  user = 'yourusernamehere',
+  password = 'yourpasswordhere'
+)
+
+# Loop over each month_number
+# Establish raster on the totalequids field for each month
+# Write each monthly raster to PostgreSQL
+for  (i in 1:12){
+  pgWriteRast(con, paste0("raster", i), raster::raster((
+    terra::rasterize(terra::vect(routes[which(routes$month_number == i), ]),
+                     r,
+                     field = "totalequids",  
+                     sum = TRUE)
+  )), append = FALSE)
+}
+
+# Write the full year raster as well
+pgWriteRast(con, "raster2022", raster::raster(
+  (terra::rasterize(
+    terra::vect(routes),
+    r, 
+    field = "totalequids",  
+    sum = TRUE
+    )
+   )
+  ), append = FALSE)
+
+#Close database connection
+dbDisconnect(con)
+```
+
+## Section 3 - Establish risk proportions for routes
+
+The proportion of each route that is made up of different AHS risk classes is defined in short through the following process:
+
+-   Establish raster of the AHS risk across the country on a daily basis
+
+-   Extract the raster values for each pixel along each route on the applicable day
+
+-   Establish the proportion each route has for each of the risk classes, allocating zero to risk classes that did not intersect each route
+
+-   This process is repeated for aggregation at a monthly basis
+
+### Risk proportions for the entire year
+
+```{r, eval=FALSE}
+#Language: R
+
+library(sf)
+library(terra)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+
+#source data
+zaf <- terra::vect("./data/rsa.shp") #South African boundary
+r <- terra::rast(zaf, res=0.0866)
+svareas = st_read("./data/svareas.shp") #State vet areas of South Africa
+asd <- read.csv("data/2022asd.csv") # Area status declaration per State Vet area per day of the year
+
+# use routes imported from database in previous section
+# convert to a sf object
+routes = sf::st_as_sf(routes)
+
+#create empty vectors to put proportion values into
+low_propVect <- c()
+high_propVect <- c()
+partial_propVect <- c()
+unknown_propVect <- c()
+
+#loop over unique movement dates
+for(i in as.character(unique(routes$movementdate))){ # 1. for every movement date 
+  #Create temporary ASD polygon, allocate SV area status and from there a raster of it
+  asd.temp = asd[which(asd$dd == i),]
+  asd.temp = terra::vect(merge(svareas, asd.temp, by.x = "statevetco", by.y = "svcode"))
+  asd.temp <- rasterize(asd.temp, r, field="asdclass")
+  
+  # Create temporary routes vector
+  routestest.temp = terra::vect(routes[which(routes$movementdate == i),])
+  
+  #Extract the raster value (ASD status) along each point of the route and convert to data.table
+  rast.temp = data.table(terra::extract(asd.temp, routestest.temp))
+  
+  #Loop over the id values for these data and tabulate after allocation of unknown risk to null data - i.e. one route raster per route
+  for ( j in unique(sort(rast.temp$ID))){
+    subrast.temp = rast.temp[ which(ID == j),]
+    # Fill the outputs table with "unknown risk" for empty values
+    subrast.temp$asdclass <- ifelse(is.na(subrast.temp$asdclass), "unknown", as.character(subrast.temp$asdclass))
+    freq_table = table(subrast.temp$asdclass)
+    
+    #Calculate the total number of values
+    total_values <- sum(freq_table)
+    
+    #Calculate the proportion of times each risk type appears and append to the prop vectors. If the proportion type doesn't appear in the frequency table, assign it the value 0
+    low_prop <- freq_table["low risk"] / total_values
+    low_prop = ifelse(is.na(low_prop), 0, low_prop)
+    low_propVect = c(low_propVect, low_prop)
+    
+    high_prop <- freq_table["high risk"] / total_values
+    high_prop = ifelse(is.na(high_prop), 0, high_prop)
+    high_propVect = c(high_propVect, high_prop)
+    
+    partial_prop <- freq_table["partial risk"] / total_values
+    partial_prop = ifelse(is.na(partial_prop), 0, partial_prop)
+    partial_propVect = c(partial_propVect, partial_prop)
+    
+    unknown_prop <- freq_table["unknown"] / total_values
+    unknown_prop = ifelse(is.na(unknown_prop), 0, unknown_prop)
+    unknown_propVect = c(unknown_propVect, unknown_prop)
+  }
+}
+
+#concatenate the proportion vectors together for the violin plot
+
+proportion <- c(low_propVect, high_propVect, partial_propVect, unknown_propVect)
+risktype <- rep(c("low risk", "high risk", "partial risk", "unknown"), each=length(low_propVect))
+
+#make a data frame for ggplot
+df <- data.frame(risktype, proportion)
+
+ggplot(df, aes(x=risktype, y=proportion)) +
+    geom_violin(fill="grey", color="black", draw_quantiles = c(0.5)) +
+    theme_classic()+
+    xlab("Risk type") +
+    ylab("Proportion of route")
+
+# Spread of proportions
+dft = data.table(df)
+
+# group the data by "risktype" and get spread group
+dft[, .(percentile_95 = quantile(proportion, probs = c(0.025, 0.5, 0.95))), 
+                 by = risktype]
+```
+
+### Risk proportions for each month of the year
+
+```{r, eval=FALSE}
+#Language: R
+#Note libraries and base data as section above for annual aggregation
+
+#Empty list to put plots for each month into
+plots <- list()
+
+#loop over the months
+for (k in 1:12){
+  #create sub data frame for routes that took place in month k
+  monthroutes <- routes[which(routes$month_number==k),]
+  
+  #create empty vectors to insert proportion values into
+  low_propVect <- c()
+  high_propVect <- c()
+  partial_propVect <- c()
+  unknown_propVect <- c()
+  
+  #loop over unique movement dates in the month
+  for(i in as.character(unique(monthroutes$movementdate))){ # 1. for every movement date 
+    #Create temporary ASD polygon, allocate SV area status and from there a raster of it
+    asd.temp = asd[which(asd$dd == i),]
+    asd.temp = terra::vect(merge(svareas, asd.temp,
+               by.x = "statevetco",
+               by.y = "svcode"))
+    asd.temp <- rasterize(asd.temp, r, field="asdclass")
+    
+    # Create temporary routes vector
+    routestest.temp = terra::vect(
+                      monthroutes[which(monthroutes$movementdate == i),])
+    
+    #Extract the raster value (ASD status) along each point of the route and convert to data.table
+    rast.temp = data.table(terra::extract(asd.temp, routestest.temp))
+    
+    #Loop over the id values for these data and tabulate after allocation of unknown risk to null data - i.e. one route raster per route
+    for ( j in unique(sort(rast.temp$ID))){
+      subrast.temp = rast.temp[ which(ID == j),]
+      # Fill the outputs table with "unknown risk" for empty values
+      subrast.temp$asdclass <- ifelse(is.na(subrast.temp$asdclass), "unknown", as.character(subrast.temp$asdclass))
+      freq_table = table(subrast.temp$asdclass)
+      
+      # Calculate the total number of values per rasterised route
+      total_values <- sum(freq_table)
+      
+      # Calculate the proportion of times each risk type appears and append to the prop vectors. If the proportion type doesn't appear in the frequency table, assign it the value 0
+      low_prop <- freq_table["low risk"] / total_values
+      low_prop = ifelse(is.na(low_prop), 0, low_prop)
+      low_propVect = c(low_propVect, low_prop)
+      
+      high_prop <- freq_table["high risk"] / total_values
+      high_prop = ifelse(is.na(high_prop), 0, high_prop)
+      high_propVect = c(high_propVect, high_prop)
+      
+      partial_prop <- freq_table["partial risk"] / total_values
+      partial_prop = ifelse(is.na(partial_prop), 0, partial_prop)
+      partial_propVect = c(partial_propVect, partial_prop)
+      
+      unknown_prop <- freq_table["unknown"] / total_values
+      unknown_prop = ifelse(is.na(unknown_prop), 0, unknown_prop)
+      unknown_propVect = c(unknown_propVect, unknown_prop)
+    }
+  }
+  
+  #concatenate the proportion vectors together for the violin plot
+  proportion <- c(low_propVect, 
+                  high_propVect, 
+                  partial_propVect, 
+                  unknown_propVect)
+  
+  risktype <- rep(c("Low", "High", "Part", "Unk"), each=length(low_propVect))
+  
+  
+  #make a data frame for ggplot
+  df <- data.frame(risktype, proportion)
+  
+  #make the violin plot
+  p <- ggplot(df, aes(x=risktype, y=proportion)) +
+    geom_violin(fill="grey", color="black", draw_quantiles = c(0.5)) +
+    theme_classic()+
+    ggtitle(paste(k)) +
+    xlab("Risk type") +
+    ylab("Proportion of route")
+  
+  #Add the plot to the list of plots
+  plots[[k]] <- p
+}
+
+#Use grid.arrange to arrange the plots in a grid layout
+grid_arranged <- grid.arrange(grobs = plots, nrow = 3 )
+
+grid_arranged
+```
+
+## Section 4 - Aggregating the routing data
+
+The aggregation of routing data for the number of movement, average number of equines per movement, average duration and average distance traveled was performed directly in SQL in the database. Below the data is aggregated at month level and unioned to a similar query that is aggregated across the dataset. The final section just creates more readable outcomes for full months rather than month number.
+
+```{sql, eval=FALSE}
+--Language: SQL
+
+WITH monthlydata as (
+WITH CTE AS (
+SELECT EXTRACT(MONTH FROM movementdate::date) as month, totalequids, distance, duration FROM routing2022 
+)
+SELECT month,
+count(*) AS totalmoves,
+avg(totalequids) as avgequids,
+avg(distance) as avgdist,
+avg(duration) as avgdur
+FROM CTE
+GROUP BY month
+ORDER by month),
+annualdata as (
+WITH CTE AS (
+SELECT EXTRACT(MONTH FROM movementdate::date) as month, totalequids, distance, duration FROM routing2022 
+)
+SELECT 2022 as month,
+count(*) AS totalmoves,
+avg(totalequids) as avgequids,
+avg(distance) as avgdist,
+avg(duration) as avgdur
+FROM CTE
+)
+SELECT 
+month,
+CASE 
+WHEN month = 1 THEN 'January'
+WHEN month = 2 THEN 'February' 
+WHEN month = 3 THEN 'March' 
+WHEN month = 4 THEN 'April' 
+WHEN month = 5 THEN 'May' 
+WHEN month = 6 THEN 'June' 
+WHEN month = 7 THEN 'July' 
+WHEN month = 8 THEN 'August' 
+WHEN month = 9 THEN 'September' 
+WHEN month = 10 THEN 'October' 
+WHEN month = 11 THEN 'November' 
+WHEN month = 12 THEN 'December' 
+ELSE 'Other' 
+END as periodlabel, 
+totalmoves,
+round(avgequids, 2) as avgequids, 
+round(avgdist::numeric, 2) as avgdist, 
+round(avgdur::numeric, 2) as avgdur
+FROM monthlydata
+UNION ALL
+SELECT month, month::text as periodlabel, 
+totalmoves,
+round(avgequids::numeric, 2) as avgequids, 
+round(avgdist::numeric, 2) as avgdis,
+round(avgdur::numeric, 2) as avgdur
+FROM annualdata
+```
+
+### Aggregation of movements per province 
+
+```{r, eval=FALSE}
+library(sf)
+library(data.table)
+
+points <- read.csv("data/2022Horses.csv")
+svareas = st_read("./data/svareas.shp") #State vet areas of South Africa
+points_sf <- st_as_sf(points, coords = c("src_longitude", "src_latitude"), crs = st_crs(svareas))
+
+# Join points to polygons
+joined <- st_join(points_sf, svareas)
+
+# Convert joined sf object to data.table
+joined_dt <- as.data.table(joined)
+
+# Count number of points per polygon using data.table syntax
+counts_dt <- joined_dt[, .(n = .N), by = .(province)]
+counts_dt[, prop := n / sum(n)]
+
+```
+
+## Section 5 - Transport events for each day of the year
+
+The final section is to generate the Supplementary figure 1 evaluating weekday of movement across 2022.
+
+```{r, eval=FALSE}
+#Language: R
+
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(data.table)
+
+data <- read.csv("data/2022Horses.csv")
+data$movementdate = as.Date(data$movementdate)
+
+# Group by movementdate and count rows in each group
+data = data.table(data)
+data[, activity := .N, by = movementdate]
+data <- unique(data[, .(movementdate, activity)])
+
+# create week and weekday columns
+data$week <- week(data$movementdate)
+data$weekday <- lubridate::wday(data$movementdate, label = TRUE)
+
+# create a custom color palette
+colors <- c("#ebedf0", "#c6e48b", "#7bc96f", "#239a3b", "#196127")
+pal <- scales::manual_pal(colors)
+
+# create the plot
+ggplot(data, aes(x = week, y = weekday, fill = activity)) +
+  geom_tile(color = "white", width = 1, height = 0.4) +
+  scale_fill_gradientn(colors = colors, values = rescale(c(0, max(data$activity))), guide = "none") +
+  scale_x_continuous(expand = c(0, 0), position = "top", breaks = seq(1, 52, by = 2)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  theme_minimal() +
+  theme(axis.line = element_blank(), axis.text.x = element_text(size = 9),
+        axis.text.y = element_text(size = 9), axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        panel.grid.major = element_line(color = "white"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        plot.title = element_text(size = 16, hjust = 0.5, vjust = 2),
+        aspect.ratio = 0.5) +
+  labs(xlab = "Month of Year") +
+  scale_x_continuous(breaks = c(1, 6, 10, 14, 18, 23, 27, 31, 36, 40, 45, 49), 
+                     labels = month.abb[c(1:12)]) 
+```
